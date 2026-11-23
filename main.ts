@@ -56,6 +56,7 @@ class Tree {
 type Edit = (tree: Tree) => void;
 
 function detect(lines: string[]): string | null {
+  // V4A and JSON signatures are checked only on the first nonblank line.
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
   if (lines[first]!.trim() === '*** Begin Patch') return 'v4a';
@@ -165,6 +166,7 @@ const trimTail = (line: string): string => line.replace(/[ \t]+$/, '');
 const matchingTiers = [(line: string) => line, trimTail, (line: string) => trimTail(line).replace(/^[ \t]+/, '')];
 
 function matchLines(lines: string[], old: string[], strict: boolean, start = 0, end = lines.length - old.length) {
+  // Collect every match in the first tier that finds any.
   for (let tier = 0; tier < (strict ? 1 : matchingTiers.length); tier++) {
     const normalize = matchingTiers[tier]!;
     const expected = old.map(normalize);
