@@ -89,10 +89,10 @@ class Tree {
 // transforms run against the tree exactly as preceding edits leave it.
 type Edit = (tree: Tree) => void;
 
-// Sniff the format from the first meaningful line.
-// V4A and JSON announce themselves at once, while the others need
-// a scan for SEARCH markers or unified headers. A null result lets
-// the caller report a format error.
+// Detect the format by its signature: `*** Begin Patch` means v4a, a
+// leading `[` or `{` means json, a `<<<<<<< SEARCH` line means
+// search-replace, and `diff --git ` or `--- ` before `+++ ` means
+// unified. When none of the four holds, auto yields null for the caller.
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
