@@ -61,6 +61,10 @@ class Tree {
   private readonly orig = new Map<string, string | null>();
   readonly moves: [string, string][] = [];
   readonly now = new Map<string, string | null>();
+  // Read p from disk exactly once and memoize it as text or null.
+  // A non-file or stat/read error records null so a later get() can
+  // treat it as absent without retrying; the cache also fixes the
+  // baseline the final report compares against.
   original(p: string): string | null {
     if (!this.orig.has(p)) {
       let content: string | null = null;
@@ -73,6 +77,9 @@ class Tree {
     }
     return this.orig.get(p)!;
   }
+  // The staged view: pending text if an earlier edit wrote p,
+  // otherwise the memoized on-disk baseline. A null means the path
+  // is currently deleted, so later edits see preceding results.
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
@@ -210,9 +217,18 @@ function joinFile(lines: string[], br = '\n', final = true): string {
 // order while stored text is never rewritten.
 type Replacement = { text: string; context?: number; noBreak?: boolean };
 type LineEdit = { old: string[]; next: Replacement[] };
+// A fresh, empty block: no expected old lines and no replacement
+// lines. Parsers grow both sides as they read body markers.
 const emptyLineEdit = (): LineEdit => ({ old: [], next: [] });
+// The leading spaces or tabs of a line, used to reindent loose
+// matches. The anchored pattern always matches, even when empty.
 const indent = (line: string): string => /^[ \t]*/.exec(line)![0];
+// Strip trailing spaces and tabs so the middle matching tier can
+// ignore insignificant padding at line ends.
 const trimTail = (line: string): string => line.replace(/[ \t]+$/, '');
+// Exact, then ignore trailing space, then also ignore leading
+// indentation. matchLines walks these strictest first and stops
+// at the first tier with a hit.
 const matchingTiers = [(line: string) => line, trimTail, (line: string) => trimTail(line).replace(/^[ \t]+/, '')];
 
 // Scan the inclusive start..end window for the whole old block.
@@ -369,6 +385,9 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
         if (!match) throw new Fail('no-match', old);
         tier = match.tier;
         const target = expected - 1n;
+        // Unsigned distance from a candidate position to the
+        // header's expected start, so the nearest match wins after
+        // accumulated line drift.
         const distance = (position: number): bigint => {
           const delta = BigInt(position) - target;
           return delta < 0n ? -delta : delta;
@@ -390,11 +409,18 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
 function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
   let section: UnifiedSection | undefined;
+  // A --- header only counts with its +++ mate directly below it,
+  // which keeps stray body dashes from closing the current hunk.
   const isHeaderPair = (i: number) => lines[i]?.startsWith('--- ') && lines[i + 1]?.startsWith('+++ ');
+  // Take the path from a ---/+++ header, dropping any tab timestamp
+  // and the a/ or b/ prefix. /dev/null becomes null for creates and
+  // deletes.
   const readHeaderPath = (line: string) => {
     const path = line.slice(4).split('\t', 1)[0]!.trim();
     return path === '/dev/null' ? null : path.replace(/^[ab]\//, '');
   };
+  // Emit the section in progress, if any, before a new header or
+  // marker starts the next one. The null check skips empty runs.
   const finishSection = () => {
     if (section) edits.push(unifiedEdit(section, strict));
   };
