@@ -20,11 +20,13 @@ class Fail {
 
 const blank = (s: string): boolean => s.trim() === '';
 
+// Normalize patch records from LF or CRLF input.
+// A terminal newline ends the last record without adding an empty one.
 function patchLines(text: string): string[] {
   if (text === '') return [];
   const lines = text.split('\n');
   if (text.endsWith('\n')) lines.pop();
-  return lines.map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+  return lines.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
 }
 
 function safe(p: string): boolean {
@@ -55,19 +57,21 @@ class Tree {
 
 type Edit = (tree: Tree) => void;
 
+// Use the first nonblank line for V4A and JSON signatures.
+// Search the whole patch for SEARCH markers and unified headers.
 function detect(lines: string[]): string | null {
-  // V4A and JSON signatures are checked only on the first nonblank line.
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) return null;
   if (lines[first]!.trim() === '*** Begin Patch') return 'v4a';
-  const c = lines[first]!.trimStart()[0];
-  if (c === '[' || c === '{') return 'json';
+  const initial = lines[first]!.trimStart()[0];
+  if (initial === '[' || initial === '{') return 'json';
   if (lines.some((l) => l.trimEnd() === '<<<<<<< SEARCH')) return 'search-replace';
   if (lines.some((l, i) => l.startsWith('diff --git ') || (l.startsWith('--- ') && (lines[i + 1] ?? '').startsWith('+++ ')))) return 'unified';
   return null;
 }
 
-/** One JSON edit object (SPEC.md section 9), or null when it is not one. */
+// Validate one JSON command and build its deferred edit.
+// Invalid command objects return null for the parser to report.
 function jsonEdit(v: unknown): Edit | null {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
@@ -94,16 +98,18 @@ function jsonEdit(v: unknown): Edit | null {
   }
   if (o.command === 'insert' && typeof o.insert_line === 'number' && Number.isInteger(o.insert_line) && typeof o.new_str === 'string') {
     const line = o.insert_line;
-    const add = patchLines(o.new_str);
+    const inserted = patchLines(o.new_str);
     return fileEdit(p, p, (before) => {
       const { lines, br, final } = splitFile(before);
       if (line < 0 || line > lines.length) throw new Fail('no-match', p);
-      return joinFile(lines.slice(0, line).concat(add, lines.slice(line)), br, final);
+      return joinFile(lines.slice(0, line).concat(inserted, lines.slice(line)), br, final);
     });
   }
   return null;
 }
 
+// Parse either an array of commands or one command per nonblank line.
+// Array errors point to the opening line, while individual records report their own line.
 function jsonEdits(text: string, lines: string[]): Edit[] {
   const first = lines.findIndex((l) => !blank(l));
   if (first < 0) throw new Exit2('error: parse 1');
@@ -116,8 +122,8 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
       throw new Exit2(`error: parse ${first + 1}`);
     }
     if (!Array.isArray(v)) throw new Exit2(`error: parse ${first + 1}`);
-    for (const x of v) {
-      const e = jsonEdit(x);
+    for (const command of v) {
+      const e = jsonEdit(command);
       if (e === null) throw new Exit2(`error: parse ${first + 1}`);
       edits.push(e);
     }
@@ -165,29 +171,32 @@ const indent = (line: string): string => /^[ \t]*/.exec(line)![0];
 const trimTail = (line: string): string => line.replace(/[ \t]+$/, '');
 const matchingTiers = [(line: string) => line, trimTail, (line: string) => trimTail(line).replace(/^[ \t]+/, '')];
 
+// Try the matching tiers in order within the inclusive start range.
+// Return every position in the first tier that produces a match.
 function matchLines(lines: string[], old: string[], strict: boolean, start = 0, end = lines.length - old.length) {
-  // Collect every match in the first tier that finds any.
   for (let tier = 0; tier < (strict ? 1 : matchingTiers.length); tier++) {
     const normalize = matchingTiers[tier]!;
     const expected = old.map(normalize);
     const positions: number[] = [];
-    const normalized = tier === 0 ? lines : lines.map(normalize);
+    const candidates = tier === 0 ? lines : lines.map(normalize);
     for (let at = start; at <= end; at++) {
-      if (expected.every((line, index) => line === normalized[at + index])) positions.push(at);
+      if (expected.every((line, index) => line === candidates[at + index])) positions.push(at);
     }
     if (positions.length > 0) return { tier, positions };
   }
   return undefined;
 }
 
+// Copy context from the file to preserve its whitespace.
+// For indentation-insensitive matches, reindent additions to fit the match.
 function replaceLines(lines: string[], edit: LineEdit, at: number, tier: number): string[] {
   const from = tier === 2 ? indent(edit.old[0]!) : '';
   const to = tier === 2 ? indent(lines[at]!) : '';
-  const next = edit.next.map(({ text, context }) => {
+  const replacement = edit.next.map(({ text, context }) => {
     if (context !== undefined) return lines[at + context]!;
     return tier === 2 && !blank(text) && text.startsWith(from) ? to + text.slice(from.length) : text;
   });
-  return lines.slice(0, at).concat(next, lines.slice(at + edit.old.length));
+  return lines.slice(0, at).concat(replacement, lines.slice(at + edit.old.length));
 }
 
 function addBodyLine(edit: LineEdit, line: string): void {
@@ -200,6 +209,8 @@ function addBodyLine(edit: LineEdit, line: string): void {
   }
 }
 
+// Check paths against the tree produced by preceding edits.
+// Stage the resulting content and record moves for the final report.
 function fileEdit(
   oldPath: string | null,
   newPath: string | null,
@@ -214,20 +225,22 @@ function fileEdit(
     if (newPath !== null && (oldPath === null || move) && tree.get(newPath) !== null) {
       throw new Fail('exists', newPath);
     }
-    const after = newPath === null ? null : transform(before);
+    const updated = newPath === null ? null : transform(before);
     if (oldPath !== null && (newPath === null || move)) tree.now.set(oldPath, null);
-    if (newPath !== null) tree.now.set(newPath, after);
+    if (newPath !== null) tree.now.set(newPath, updated);
     if (move) tree.moves.push([oldPath!, newPath!]);
   };
 }
 
+// Resolve each SEARCH block's path before reading its two bodies.
+// An empty search creates a file, while a nonempty search requires a unique match.
 function searchEdits(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
-  const markers = lines.map((line) => line.trimEnd());
+  const markerLines = lines.map((line) => line.trimEnd());
   let previousEnd = -1;
   let previousPath: string | undefined;
   for (let i = 0; i < lines.length; i++) {
-    if (markers[i] !== '<<<<<<< SEARCH') continue;
+    if (markerLines[i] !== '<<<<<<< SEARCH') continue;
     let path = previousPath;
     for (let at = i - 1; at > previousEnd; at--) {
       const candidate = lines[at]!.trim();
@@ -236,8 +249,8 @@ function searchEdits(lines: string[], strict: boolean): Edit[] {
         break;
       }
     }
-    const separator = markers.indexOf('=======', i + 1);
-    const end = separator < 0 ? -1 : markers.indexOf('>>>>>>> REPLACE', separator + 1);
+    const separator = markerLines.indexOf('=======', i + 1);
+    const end = separator < 0 ? -1 : markerLines.indexOf('>>>>>>> REPLACE', separator + 1);
     if (path === undefined || end < 0) parseFault(i);
     const p = path;
     const old = lines.slice(i + 1, separator);
@@ -267,16 +280,18 @@ type UnifiedSection = {
   hunks: Hunk[];
 };
 
+// Convert a parsed unified section into one file edit.
+// Offset each hunk's expected position by the preceding hunks' net line change.
 function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
   const { paths, git, renameFrom, renameTo, hunks } = section;
   const old = paths ? paths[0] : renameFrom ?? git?.[0] ?? null;
   const next = paths ? paths[1] : renameTo ?? git?.[1] ?? null;
-  const named = [old, next].filter((p): p is string => p !== null);
+  const namedPaths = [old, next].filter((p): p is string => p !== null);
   if (old === null || section.create) {
     const added = hunks.flatMap((hunk) => hunk.next.filter((line) => line.context === undefined));
-    return fileEdit(null, next, () => joinFile(added.map((line) => line.text), '\n', !added.at(-1)?.noBreak), named);
+    return fileEdit(null, next, () => joinFile(added.map((line) => line.text), '\n', !added.at(-1)?.noBreak), namedPaths);
   }
-  if (next === null || section.delete) return fileEdit(old, null, () => '', named);
+  if (next === null || section.delete) return fileEdit(old, null, () => '', namedPaths);
 
   return fileEdit(old, next, (text) => {
     const { lines: original, br, final: ended } = splitFile(text);
@@ -305,9 +320,11 @@ function unifiedEdit(section: UnifiedSection, strict: boolean): Edit {
       drift += BigInt(hunk.next.length - hunk.old.length);
     }
     return joinFile(lines, br, final);
-  }, named);
+  }, namedPaths);
 }
 
+// Group file headers, metadata, and hunks into unified sections.
+// Read hunk bodies from their line markers, allowing stale header counts.
 function unifiedEdits(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
   let section: UnifiedSection | undefined;
@@ -316,7 +333,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     const path = line.slice(4).split('\t', 1)[0]!.trim();
     return path === '/dev/null' ? null : path.replace(/^[ab]\//, '');
   };
-  const finish = () => {
+  const finishSection = () => {
     if (section) edits.push(unifiedEdit(section, strict));
   };
   let i = 0;
@@ -325,11 +342,11 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     if (line === 'diff --git' || line.startsWith('diff --git ')) {
       const header = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
       if (!header) parseFault(i);
-      finish();
+      finishSection();
       section = { git: [header[1]!, header[2]!], hunks: [] };
     } else if (pairAt(i)) {
       if (!section?.git || section.paths || section.hunks.length > 0) {
-        finish();
+        finishSection();
         section = { hunks: [] };
       }
       section.paths = [headerPath(line), headerPath(lines[++i]!)];
@@ -363,7 +380,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
     }
     i++;
   }
-  finish();
+  finishSection();
   return edits;
 }
 
@@ -371,6 +388,8 @@ type Chunk = LineEdit & { anchor: string; eof: boolean };
 const v4aHeader = /^\*\*\* (Add|Delete|Update) File: (.*)$/;
 const moveHeader = '*** Move to: ';
 
+// Parse the enclosed V4A file operations.
+// Apply update chunks in order, advancing past each replacement.
 function v4aEdits(lines: string[], strict: boolean): Edit[] {
   const first = lines.findIndex((line) => !blank(line));
   if (first < 0 || lines[first]!.trim() !== '*** Begin Patch') parseFault(Math.max(first, 0));
@@ -406,8 +425,8 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
       if (i < bodyEnd) parseFault(i);
       edits.push(fileEdit(path, null, () => ''));
     } else {
-      const move = i < bodyEnd && lines[i]!.startsWith(moveHeader);
-      const destination = move ? lines[i++]!.slice(moveHeader.length).trim() : path;
+      const hasMove = i < bodyEnd && lines[i]!.startsWith(moveHeader);
+      const destination = hasMove ? lines[i++]!.slice(moveHeader.length).trim() : path;
       const chunks: Chunk[] = [];
       let chunk: Chunk | undefined;
       for (; i < bodyEnd; i++) {
@@ -426,7 +445,7 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           addBodyLine(chunk, line);
         }
       }
-      if (chunks.length === 0 && !move) parseFault(start);
+      if (chunks.length === 0 && !hasMove) parseFault(start);
       edits.push(fileEdit(path, destination, (text) => {
         const { lines: original, br, final } = splitFile(text);
         let lines = original;
@@ -450,18 +469,20 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           cursor = at + chunk.next.length;
         }
         return joinFile(lines, br, final);
-      }, [path, destination], move));
+      }, [path, destination], hasMove));
     }
     i = end;
   }
   return edits;
 }
 
+// Read the CLI arguments, parse the patch, and stage its edits in order.
+// Write the staged changes only after validation succeeds and check mode is off.
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
   let strict = false;
-  const pos: string[] = [];
+  const positional: string[] = [];
   let ended = false;
   for (const a of args) {
     if (!ended && a === '--') ended = true;
@@ -470,10 +491,10 @@ function run(args: string[]): { code: number; out: string[] } {
       else if (a === '--check' && !check) check = true;
       else if (a === '--strict' && !strict) strict = true;
       else return { code: 2, out: ['error: usage'] };
-    } else pos.push(a);
+    } else positional.push(a);
   }
-  if (pos.length > 1) return { code: 2, out: ['error: usage'] };
-  const file = pos.length === 0 || pos[0] === '-' ? null : pos[0]!;
+  if (positional.length > 1) return { code: 2, out: ['error: usage'] };
+  const file = positional.length === 0 || positional[0] === '-' ? null : positional[0]!;
   let text = '';
   try {
     text = readFileSync(file ?? 0, 'utf8');
